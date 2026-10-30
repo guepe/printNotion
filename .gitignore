@@ -1,0 +1,8 @@
+/target
+
+# Secrets : ne jamais commiter de token Notion
+config.toml
+.env
+
+# PDF générés par l'outil
+*.pdf

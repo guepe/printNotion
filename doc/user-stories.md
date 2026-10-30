@@ -1,4 +1,4 @@
-D'accord, on reste au niveau du besoin, sans code. Voici une première version, qu'on ajustera ensemble.
+# User stories : printNotion
 
 **Vision**
 En tant qu'administrateur IT, je veux imprimer des pages Notion avec une mise en page maîtrisée, afin d'obtenir des documents papier propres, lisibles et datés.
@@ -19,6 +19,14 @@ _Critères d'acceptation :_ l'en-tête porte le titre du document, le pied de pa
 En tant qu'utilisateur, je veux pouvoir envoyer le PDF directement à une imprimante, afin d'éviter de l'ouvrir manuellement.
 _Critères d'acceptation :_ une option de la commande envoie le PDF à l'imprimante par défaut, ou à une imprimante nommée.
 
-**Hors périmètre V1 :** impression d'une base Notion entière, images, tableaux, toggles, callouts, logo ou charte Teconex. On les ajoutera ensuite, chacun sous forme de nouvelle user story.
+**US5 : Blocs de structure**
+En tant qu'utilisateur, je veux que les colonnes, les blocs dépliables et les sous-pages apparaissent dans le PDF, afin que les pages structurées (comme un menu de la semaine) ne sortent pas vides.
+_Critères d'acceptation :_ les colonnes sont rendues côte à côte, en largeurs égales. Les toggles (et titres dépliables) sont imprimés dépliés : leur titre, puis leur contenu. Une sous-page apparaît comme une ligne portant son titre et un lien vers elle, sans imprimer son contenu.
+
+**US6 : Bases de données intégrées**
+En tant qu'utilisateur, je veux que les bases intégrées dans une page soient imprimées sous forme de tableau, afin de retrouver sur papier leur contenu (menus, listes de courses…).
+_Critères d'acceptation :_ chaque base est précédée de son titre, avec une ligne d'en-tête répétée sur chaque page. Le tableau reflète la première vue de la base, comme dans Notion : mêmes filtres (y compris les filtres rapides), même tri, mêmes colonnes visibles dans le même ordre. Les valeurs (texte, dates, sélections, cases à cocher, relations…) sont lisibles. Si la vue ne définit pas de colonnes, toutes sont imprimées sauf celles vides partout, et les boutons ne sont jamais imprimés. Si un tableau dépasse 4 colonnes, le document passe en A4 paysage. Une base inaccessible (par exemple une vue liée dont la base d'origine n'est pas partagée) est signalée par un avertissement qui explique quoi faire, sans bloquer le reste.
+
+**Hors périmètre V1 :** impression d'une base Notion seule (hors page), contenu des sous-pages, choix d'une autre vue que la première, images, tableaux, callouts, logo ou charte Teconex. On les ajoutera ensuite, chacun sous forme de nouvelle user story.
 
 **Hypothèse à confirmer :** j'ai supposé qu'en V1 tu imprimes des pages isolées, à la demande.

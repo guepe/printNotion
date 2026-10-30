@@ -4,3 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+clap = { version = "4", features = ["derive"] }
+dirs = "7.0.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+toml = "1.1.8"
+typst-as-lib = "0.17"
+typst-assets = { version = "0.15", features = ["fonts"] }
+typst-layout = "0.15"
+typst-pdf = "0.15"
+ureq = { version = "3", features = ["json"] }
