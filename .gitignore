@@ -6,3 +6,6 @@ config.toml
 
 # PDF générés par l'outil
 *.pdf
+
+# Archives de release
+/dist
