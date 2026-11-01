@@ -21,7 +21,7 @@ _Critères d'acceptation :_ une option de la commande envoie le PDF à l'imprima
 
 **US5 : Blocs de structure**
 En tant qu'utilisateur, je veux que les colonnes, les blocs dépliables et les sous-pages apparaissent dans le PDF, afin que les pages structurées (comme un menu de la semaine) ne sortent pas vides.
-_Critères d'acceptation :_ les colonnes sont rendues côte à côte, en largeurs égales. Les toggles (et titres dépliables) sont imprimés dépliés : leur titre, puis leur contenu. Une sous-page apparaît comme une ligne portant son titre et un lien vers elle, sans imprimer son contenu.
+_Critères d'acceptation :_ les colonnes sont rendues côte à côte, en largeurs égales. Les toggles (et titres dépliables) sont imprimés dépliés : leur titre, puis leur contenu ; ceux qui servent d'archive (« old », « archive »…, liste réglable par `ignore_toggles` dans le fichier de configuration) sont omis. Une sous-page apparaît comme une ligne portant son titre et un lien vers elle, sans imprimer son contenu.
 
 **US6 : Bases de données intégrées**
 En tant qu'utilisateur, je veux que les bases intégrées dans une page soient imprimées sous forme de tableau, afin de retrouver sur papier leur contenu (menus, listes de courses…).
@@ -33,7 +33,7 @@ _Critères d'acceptation :_ lancé sans argument, l'outil ouvre une fenêtre ; u
 
 **US8 : Rendu fidèle à Notion**
 En tant qu'utilisateur, je veux que le PDF ressemble à ma page Notion, afin de m'y retrouver immédiatement sur papier.
-_Critères d'acceptation :_ couverture, icône de la page et emojis sont imprimés. Les sélections et statuts sont des étiquettes colorées aux couleurs de Notion. Chaque base porte le nom et l'icône de sa base d'origine, et l'onglet de sa vue. Les colonnes reprennent les largeurs et la visibilité de la vue. Une vue groupée est imprimée par groupes, une vue calendrier comme une grille de la période affichée, une galerie comme des cartes. Les colonnes de la page sont respectées tant que leur contenu y tient. Une page contenant des bases en colonnes passe en paysage.
+_Critères d'acceptation :_ couverture, icône de la page et emojis sont imprimés. Les sélections et statuts sont des étiquettes colorées aux couleurs de Notion. Chaque base porte le nom et l'icône de sa base d'origine, et l'onglet de sa vue. Les colonnes reprennent les largeurs et la visibilité de la vue. Une vue groupée est imprimée par groupes, une vue calendrier comme une grille de la période affichée, une galerie comme des cartes. Les colonnes de la page sont respectées tant que leur contenu y tient. Une page contenant des bases en colonnes passe en paysage. Une petite base n'est jamais coupée entre deux pages, et une ligne n'apparaît qu'une fois même si elle appartient à plusieurs groupes. Comme dans Notion, une vue sans retour à la ligne coupe les textes longs avec « … ».
 
 **Hors périmètre V1 :** impression d'une base Notion seule (hors page), contenu des sous-pages, choix d'une autre vue que la première, ordre manuel des groupes, images dans le contenu, tableaux, callouts, logo ou charte Teconex. On les ajoutera ensuite, chacun sous forme de nouvelle user story.
 

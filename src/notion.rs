@@ -33,10 +33,12 @@ pub struct Client {
     relation_titles: Mutex<HashMap<String, String>>,
     /// Nombre de requêtes HTTP en cours, plafonné à `MAX_CONCURRENT_REQUESTS`.
     in_flight: (Mutex<usize>, Condvar),
+    /// Titres (en minuscules) des toggles à ne pas imprimer.
+    ignored_toggles: Vec<String>,
 }
 
 impl Client {
-    pub fn new(token: String) -> Self {
+    pub fn new(token: String, ignored_toggles: Vec<String>) -> Self {
         let agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .build()
@@ -48,6 +50,7 @@ impl Client {
             access_denied: AtomicUsize::new(0),
             relation_titles: Mutex::new(HashMap::new()),
             in_flight: (Mutex::new(0), Condvar::new()),
+            ignored_toggles,
         }
     }
 
@@ -128,6 +131,8 @@ impl Client {
                 let children = if has_children { self.fetch_blocks(id)? } else { Vec::new() };
                 Block::Heading { level, text, children }
             }
+            // Toggle d'archive (« old »…) : replié dans Notion, inutile sur papier ; on ne lit même pas son contenu.
+            "toggle" if self.ignored_toggles.contains(&plain(&text).trim().to_lowercase()) => return Ok(None),
             "paragraph" | "toggle" | "bulleted_list_item" | "numbered_list_item" => {
                 let children = if has_children { self.fetch_blocks(id)? } else { Vec::new() };
                 match kind {
@@ -271,7 +276,8 @@ impl Client {
                     .into_iter()
                     .map(|g| RowGroup { label: g.label, rows: g.rows.into_iter().map(strip).collect() })
                     .collect();
-                Layout::Table { headers, widths, groups }
+                let wrap = view["configuration"]["wrap_cells"].as_bool() == Some(true);
+                Layout::Table { headers, widths, wrap, groups }
             }
         };
         Ok(Block::Database(Database { title, icon, view_name, layout }))
@@ -528,8 +534,7 @@ fn monday_of(day: NaiveDate) -> NaiveDate {
 }
 
 /// Répartit les lignes selon la propriété de regroupement de la vue (sélection, multi-sélection
-/// ou statut), dans l'ordre des options de la base. Une ligne multi-sélection apparaît dans chacun
-/// de ses groupes, comme dans Notion. Les groupes vides ne sont pas imprimés.
+/// ou statut), dans l'ordre des options de la base. Les groupes vides ne sont pas imprimés.
 fn group_rows(view: &Value, schema: &Value, pages: &[Value], rows: Vec<Vec<Cell>>) -> Vec<RowGroup> {
     let group_by = &view["configuration"]["group_by"];
     let kind = group_by["type"].as_str().unwrap_or_default();
@@ -552,12 +557,20 @@ fn group_rows(view: &Value, schema: &Value, pages: &[Value], rows: Vec<Vec<Cell>
     };
     let page_values: Vec<Vec<String>> = pages.iter().map(values).collect();
 
+    // Sur papier, une ligne n'est imprimée qu'une fois : dans le premier de ses groupes.
+    let mut placed = vec![false; rows.len()];
     let mut groups: Vec<RowGroup> = options
         .iter()
         .map(|option| {
             let name = option["name"].as_str().unwrap_or_default();
-            let rows = rows.iter().zip(&page_values).filter(|(_, v)| v.iter().any(|n| n == name)).map(|(r, _)| r.clone()).collect();
-            RowGroup { label: Some(properties::tag(name, option["color"].as_str().unwrap_or("default"))), rows }
+            let mut group_rows = Vec::new();
+            for (i, values) in page_values.iter().enumerate() {
+                if !placed[i] && values.iter().any(|n| n == name) {
+                    placed[i] = true;
+                    group_rows.push(rows[i].clone());
+                }
+            }
+            RowGroup { label: Some(properties::tag(name, option["color"].as_str().unwrap_or("default"))), rows: group_rows }
         })
         .collect();
     let property_name = group_by["property_name"].as_str().unwrap_or("cette propriété");

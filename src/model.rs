@@ -52,7 +52,8 @@ pub type Cell = Vec<Span>;
 pub enum Layout {
     /// Tableau, éventuellement découpé en groupes (vue groupée par une propriété).
     /// `widths` reprend la largeur des colonnes dans Notion (en pixels), utilisée en proportions.
-    Table { headers: Vec<String>, widths: Vec<u32>, groups: Vec<RowGroup> },
+    /// `wrap` : la vue renvoie le texte à la ligne ; sinon, comme Notion, les cellules sont coupées.
+    Table { headers: Vec<String>, widths: Vec<u32>, wrap: bool, groups: Vec<RowGroup> },
     /// Calendrier : grille de `weeks` semaines (lundi → dimanche) à partir de `first_day`.
     /// `month` est le mois affiché pour une vue mensuelle (les autres jours sont grisés).
     Calendar {

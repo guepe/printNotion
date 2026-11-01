@@ -87,6 +87,7 @@ mod tests {
                 layout: Layout::Table {
                     headers: vec!["Plat".into(), "Jour".into(), "Fait".into()],
                     widths: vec![280, 200, 40],
+                    wrap: false,
                     groups: vec![RowGroup {
                         label: Some(crate::properties::tag("Dinner", "orange")),
                         rows: vec![

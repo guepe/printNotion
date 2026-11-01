@@ -8,6 +8,24 @@ pub const TOKEN_ENV: &str = "NOTION_TOKEN";
 #[derive(Deserialize)]
 struct ConfigFile {
     token: Option<String>,
+    /// Titres de toggles à ne pas imprimer (archives…), sans tenir compte de la casse.
+    ignore_toggles: Option<Vec<String>>,
+}
+
+/// Toggles ignorés par défaut : ceux qui servent d'archive, généralement repliés dans Notion.
+const DEFAULT_IGNORED_TOGGLES: [&str; 5] = ["old", "archive", "archives", "ancien", "anciens"];
+
+/// Titres de toggles à ne pas imprimer, en minuscules. Réglable dans le fichier de configuration :
+/// `ignore_toggles = ["old", "brouillons"]` (une liste vide imprime tous les toggles).
+pub fn ignored_toggles() -> Vec<String> {
+    let configured = config_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|raw| toml::from_str::<ConfigFile>(&raw).ok())
+        .and_then(|config| config.ignore_toggles);
+    match configured {
+        Some(titles) => titles.iter().map(|t| t.trim().to_lowercase()).collect(),
+        None => DEFAULT_IGNORED_TOGGLES.iter().map(|t| (*t).to_owned()).collect(),
+    }
 }
 
 /// Emplacement du fichier de configuration : `<config>/printnotion/config.toml`.

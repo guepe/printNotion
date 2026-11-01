@@ -73,8 +73,8 @@ fn is_landscape(page: &Page) -> bool {
 /// Couverture pleine largeur, icône qui la chevauche, puis titre — comme l'en-tête d'une page Notion.
 fn render_title(page: &Page, flipped: bool, out: &mut String) {
     if page.cover.is_some() {
-        let height = if flipped { 4.0 } else { 4.6 };
-        let gap = height - MARGIN_TOP_CM - if page.icon.is_some() { 1.1 } else { -0.4 };
+        let height = if flipped { 3.2 } else { 4.0 };
+        let gap = height - MARGIN_TOP_CM - if page.icon.is_some() { 0.9 } else { -0.3 };
         out.push_str(&format!(
             "#place(top + left, dx: -{MARGIN_X_CM}cm, dy: -{MARGIN_TOP_CM}cm, \
              image({}, width: 100% + {}cm, height: {height}cm, fit: \"cover\"))\n#v({gap:.2}cm)\n",
@@ -83,10 +83,10 @@ fn render_title(page: &Page, flipped: bool, out: &mut String) {
         ));
     }
     if let Some(icon) = &page.icon {
-        out.push_str(&format!("#text(size: 40pt)[#{}]\n#v(-0.4em)\n", string_literal(icon)));
+        out.push_str(&format!("#text(size: 32pt)[#{}]\n#v(-0.5em)\n", string_literal(icon)));
     }
     out.push_str(&format!(
-        "#text(size: 26pt, weight: \"bold\", fill: rgb(\"#191919\"))[#{}]\n#v(0.4em)\n\n",
+        "#text(size: 22pt, weight: \"bold\", fill: rgb(\"#191919\"))[#{}]\n#v(0.2em)\n\n",
         string_literal(&page.title)
     ));
 }
@@ -206,7 +206,12 @@ fn column_fits(column: &Column, flipped: bool) -> bool {
 
 /// En-tête de base (icône, nom de la base d'origine, onglet de la vue) puis son contenu.
 fn render_database(database: &Database, out: &mut String) {
-    out.push_str("#block(above: 1.4em, below: 1em, width: 100%)[\n#block(sticky: true, below: 0.6em)[");
+    // Une petite base tient d'un seul tenant : mieux vaut la reporter à la page suivante que
+    // laisser une ligne orpheline. Les grandes bases peuvent se couper (l'en-tête est répété).
+    let breakable = row_count(&database.layout) > UNBREAKABLE_ROWS;
+    out.push_str(&format!(
+        "#block(above: 1.1em, below: 0.8em, width: 100%, breakable: {breakable})[\n#block(sticky: true, below: 0.5em)["
+    ));
     if let Some(icon) = &database.icon {
         out.push_str(&format!("#text(size: 12pt)[#{}] ", string_literal(icon)));
     }
@@ -223,7 +228,7 @@ fn render_database(database: &Database, out: &mut String) {
     }
     out.push_str("]\n");
     match &database.layout {
-        Layout::Table { headers, widths, groups } => render_groups(headers, widths, groups, out),
+        Layout::Table { headers, widths, wrap, groups } => render_groups(headers, widths, *wrap, groups, out),
         Layout::Calendar { first_day, weeks, month, today, label, entries } => {
             render_calendar(*first_day, *weeks, *month, *today, label, entries, out)
         }
@@ -232,9 +237,21 @@ fn render_database(database: &Database, out: &mut String) {
     out.push_str("]\n\n");
 }
 
+/// Nombre de lignes jusqu'auquel une base n'est pas coupée entre deux pages.
+const UNBREAKABLE_ROWS: usize = 15;
+
+fn row_count(layout: &Layout) -> usize {
+    match layout {
+        Layout::Table { groups, .. } => groups.iter().map(|g| g.rows.len() + 1).sum(),
+        // Un calendrier se lit d'un seul tenant ; une galerie compte environ trois cartes par ligne.
+        Layout::Calendar { .. } => 0,
+        Layout::Gallery { cards } => cards.len() / 3,
+    }
+}
+
 const EMPTY_VIEW: &str = "#text(size: 9pt, fill: luma(150), style: \"italic\")[Aucune ligne dans cette vue]\n";
 
-fn render_groups(headers: &[String], widths: &[u32], groups: &[RowGroup], out: &mut String) {
+fn render_groups(headers: &[String], widths: &[u32], wrap: bool, groups: &[RowGroup], out: &mut String) {
     if groups.iter().all(|g| g.rows.is_empty()) {
         out.push_str(EMPTY_VIEW);
         return;
@@ -248,14 +265,14 @@ fn render_groups(headers: &[String], widths: &[u32], groups: &[RowGroup], out: &
                 group.rows.len()
             ));
         }
-        render_table(headers, widths, &group.rows, out);
+        render_table(headers, widths, wrap, &group.rows, out);
     }
 }
 
-fn render_table(headers: &[String], widths: &[u32], rows: &[Vec<Cell>], out: &mut String) {
+fn render_table(headers: &[String], widths: &[u32], wrap: bool, rows: &[Vec<Cell>], out: &mut String) {
     // Les colonnes gardent les proportions qu'elles ont dans Notion, sans descendre sous la largeur
     // du plus long mot de leur en-tête (Notion n'affiche qu'une icône pour une colonne étroite).
-    let widths: Vec<String> = widths
+    let fractions: Vec<String> = widths
         .iter()
         .zip(headers)
         .map(|(width, header)| {
@@ -267,7 +284,7 @@ fn render_table(headers: &[String], widths: &[u32], rows: &[Vec<Cell>], out: &mu
         "#[\n#set text(size: 8.5pt)\n\
          #table(\n  columns: ({},),\n  inset: (x: 6pt, y: 5pt),\n  align: left + horizon,\n  \
          stroke: (_, y) => (bottom: if y == 0 {{ 0.8pt + luma(170) }} else {{ 0.4pt + luma(228) }}),\n",
-        widths.join(", ")
+        fractions.join(", ")
     ));
     let header_cells: Vec<String> = headers
         .iter()
@@ -281,7 +298,16 @@ fn render_table(headers: &[String], widths: &[u32], rows: &[Vec<Cell>], out: &mu
         .collect();
     out.push_str(&format!("  table.header({}),\n", header_cells.join(", ")));
     for row in rows {
-        let cells: Vec<String> = row.iter().map(|cell| format!("[{}]", spans(cell))).collect();
+        let cells: Vec<String> = row
+            .iter()
+            .zip(widths)
+            .map(|(cell, width)| {
+                // Sans retour à la ligne, Notion coupe le texte au bord de la colonne : on garde à peu
+                // près ce qui tient sur deux lignes (environ 7 px par caractère à cette taille).
+                let limit = (*width as usize * 2 / 7).max(12);
+                if wrap { format!("[{}]", spans(cell)) } else { format!("[{}]", spans(&truncate(cell, limit))) }
+            })
+            .collect();
         out.push_str(&format!("  {},\n", cells.join(", ")));
     }
     out.push_str(")\n]\n");
@@ -300,7 +326,8 @@ fn render_calendar(
     entries: &[(NaiveDate, Cell)],
     out: &mut String,
 ) {
-    let height = if weeks == 1 { "3.2cm" } else { "2.1cm" };
+    // Chaque semaine prend la hauteur de son jour le plus chargé, avec un minimum pour écrire à la main.
+    let min_height = if weeks == 1 { "1.6cm" } else { "1.3cm" };
     out.push_str(&format!(
         "#text(size: 8.5pt, weight: \"semibold\", fill: luma(110))[#{}]\n#v(0.2em)\n\
          #grid(columns: (1fr,) * 7, stroke: 0.5pt + luma(228), inset: 0pt,\n",
@@ -338,7 +365,8 @@ fn render_calendar(
             })
             .collect();
         out.push_str(&format!(
-            "  block(width: 100%, height: {height}, fill: {fill}, inset: 4pt)[#align(right, {number}) #v(1pt) {cards}],\n"
+            // La colonne invisible de largeur nulle impose la hauteur minimale ; le contenu peut la dépasser.
+            "  grid.cell(fill: {fill}, inset: 4pt, grid(columns: (0pt, 1fr), box(height: {min_height}), [#align(right, {number}) #v(1pt) {cards}])),\n"
         ));
     }
     out.push_str(")\n");
@@ -366,6 +394,28 @@ fn render_gallery(cards: &[Vec<Cell>], out: &mut String) {
         "#layout(size => grid(columns: (1fr,) * calc.max(1, calc.floor(size.width / 5cm)), gutter: 8pt, {}))\n",
         rendered.join(", ")
     ));
+}
+
+/// Coupe le texte d'une cellule après `limit` caractères, avec « … ». Les étiquettes restent entières.
+fn truncate(cell: &Cell, limit: usize) -> Cell {
+    let mut left = limit;
+    let mut out = Vec::new();
+    for span in cell {
+        if span.tag.is_some() {
+            out.push(span.clone());
+            continue;
+        }
+        let length = span.text.chars().count();
+        if length <= left {
+            left -= length;
+            out.push(span.clone());
+        } else {
+            let kept: String = span.text.chars().take(left).collect();
+            out.push(Span { text: format!("{}…", kept.trim_end()), ..span.clone() });
+            break;
+        }
+    }
+    out
 }
 
 fn cell_length(cell: &Cell) -> usize {

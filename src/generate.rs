@@ -21,7 +21,7 @@ pub fn generate(page: &str, output: Option<PathBuf>) -> Result<Generated> {
     let page_id = notion::parse_page_id(page)?;
     let token = config::load_token()?;
 
-    let client = notion::Client::new(token);
+    let client = notion::Client::new(token, config::ignored_toggles());
     let page = client.fetch_page(&page_id)?;
 
     let print_date = chrono::Local::now().format("%d/%m/%Y").to_string();
