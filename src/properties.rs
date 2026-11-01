@@ -20,12 +20,18 @@ pub fn cell(prop: &Value) -> Vec<Span> {
         "formula" => scalar(&value[value["type"].as_str().unwrap_or_default()], value["type"].as_str()),
         "rollup" => match value["type"].as_str() {
             Some("array") => join(value["array"].as_array().map(|items| items.iter().map(cell).collect())),
+            // « percent_checked », « percent_per_group »… : une fraction entre 0 et 1.
+            Some("number") if value["function"].as_str().is_some_and(|f| f.starts_with("percent")) => {
+                value["number"].as_f64().map(|n| text(&format!("{} %", format_number((n * 100.0).round())))).unwrap_or_default()
+            }
             other => scalar(&value[other.unwrap_or_default()], other),
         },
-        "multi_select" | "people" | "files" => join(value.as_array().map(|items| {
+        "multi_select" => join(value.as_array().map(|items| items.iter().map(option_tag).collect())),
+        "select" | "status" => option_tag(value),
+        "people" | "files" => join(value.as_array().map(|items| {
             items.iter().map(|item| text(item["name"].as_str().unwrap_or_default())).collect()
         })),
-        "select" | "status" | "created_by" | "last_edited_by" => text(value["name"].as_str().unwrap_or_default()),
+        "created_by" | "last_edited_by" => text(value["name"].as_str().unwrap_or_default()),
         "unique_id" => match (value["prefix"].as_str(), value["number"].as_i64()) {
             (Some(prefix), Some(n)) => text(&format!("{prefix}-{n}")),
             (None, Some(n)) => text(&n.to_string()),
@@ -54,16 +60,30 @@ fn scalar(value: &Value, kind: Option<&str>) -> Vec<Span> {
     }
 }
 
+/// Option de sélection ou de statut (`{ "name", "color" }`) rendue comme étiquette colorée.
+fn option_tag(option: &Value) -> Vec<Span> {
+    tag(option["name"].as_str().unwrap_or_default(), option["color"].as_str().unwrap_or("default"))
+}
+
+/// Étiquette colorée à la manière de Notion.
+pub fn tag(name: &str, color: &str) -> Vec<Span> {
+    if name.is_empty() {
+        return Vec::new();
+    }
+    vec![Span { text: name.to_owned(), tag: Some(color.to_owned()), ..Default::default() }]
+}
+
 fn text(s: &str) -> Vec<Span> {
     if s.is_empty() { Vec::new() } else { vec![Span { text: s.to_owned(), ..Default::default() }] }
 }
 
-/// Assemble plusieurs valeurs séparées par des virgules.
+/// Assemble plusieurs valeurs : séparées par des virgules, ou par une espace entre étiquettes.
 pub fn join(parts: Option<Vec<Vec<Span>>>) -> Vec<Span> {
-    let mut out = Vec::new();
+    let mut out: Vec<Span> = Vec::new();
     for part in parts.unwrap_or_default().into_iter().filter(|p| !p.is_empty()) {
-        if !out.is_empty() {
-            out.extend(text(", "));
+        if let Some(last) = out.last() {
+            let between_tags = last.tag.is_some() && part[0].tag.is_some();
+            out.extend(text(if between_tags { " " } else { ", " }));
         }
         out.extend(part);
     }
@@ -86,7 +106,8 @@ fn format_number(n: f64) -> String {
     if n.fract() == 0.0 && n.abs() < 1e15 {
         format!("{}", n as i64)
     } else {
-        format!("{n}").replace('.', ",")
+        // Au plus deux décimales, sans zéros inutiles : 0,9166… → 0,92 ; 2,50 → 2,5.
+        format!("{n:.2}").trim_end_matches('0').trim_end_matches('.').replace('.', ",")
     }
 }
 
@@ -105,11 +126,18 @@ mod tests {
         assert_eq!(plain(json!({"type": "select", "select": null})), "");
         assert_eq!(
             plain(json!({"type": "multi_select", "multi_select": [{"name": "Végé"}, {"name": "Rapide"}]})),
-            "Végé, Rapide"
+            "Végé Rapide"
         );
+        let status = cell(&json!({"type": "status", "status": {"name": "En Stock", "color": "green"}}));
+        assert_eq!(status[0].tag.as_deref(), Some("green"));
         assert_eq!(plain(json!({"type": "checkbox", "checkbox": true})), "☑");
         assert_eq!(plain(json!({"type": "number", "number": 4.0})), "4");
         assert_eq!(plain(json!({"type": "number", "number": 2.5})), "2,5");
+        assert_eq!(plain(json!({"type": "number", "number": 0.9166666666666666})), "0,92");
+        assert_eq!(
+            plain(json!({"type": "rollup", "rollup": {"type": "number", "number": 0.9166, "function": "percent_per_group"}})),
+            "92 %"
+        );
         assert_eq!(plain(json!({"type": "date", "date": {"start": "2026-11-02", "end": null}})), "02/11/2026");
         assert_eq!(
             plain(json!({"type": "date", "date": {"start": "2026-11-02T18:30:00.000+01:00", "end": null}})),

@@ -27,6 +27,14 @@ _Critères d'acceptation :_ les colonnes sont rendues côte à côte, en largeur
 En tant qu'utilisateur, je veux que les bases intégrées dans une page soient imprimées sous forme de tableau, afin de retrouver sur papier leur contenu (menus, listes de courses…).
 _Critères d'acceptation :_ chaque base est précédée de son titre, avec une ligne d'en-tête répétée sur chaque page. Le tableau reflète la première vue de la base, comme dans Notion : mêmes filtres (y compris les filtres rapides), même tri, mêmes colonnes visibles dans le même ordre. Les valeurs (texte, dates, sélections, cases à cocher, relations…) sont lisibles. Si la vue ne définit pas de colonnes, toutes sont imprimées sauf celles vides partout, et les boutons ne sont jamais imprimés. Si un tableau dépasse 4 colonnes, le document passe en A4 paysage. Une base inaccessible (par exemple une vue liée dont la base d'origine n'est pas partagée) est signalée par un avertissement qui explique quoi faire, sans bloquer le reste.
 
-**Hors périmètre V1 :** impression d'une base Notion seule (hors page), contenu des sous-pages, choix d'une autre vue que la première, images, tableaux, callouts, logo ou charte Teconex. On les ajoutera ensuite, chacun sous forme de nouvelle user story.
+**US7 : Interface graphique**
+En tant qu'utilisateur, je veux coller l'URL d'une page dans une petite fenêtre et obtenir le PDF ouvert directement, afin de ne pas passer par le terminal.
+_Critères d'acceptation :_ lancé sans argument, l'outil ouvre une fenêtre ; un lien Notion présent dans le presse-papiers est pré-rempli. Le PDF est enregistré dans Téléchargements puis ouvert ; on peut le rouvrir ou l'afficher dans le Finder. La fenêtre ne se fige pas pendant la génération. Si des bases ne sont pas partagées, un bouton « Donner l'accès » ouvre la gestion des intégrations dans Notion.
+
+**US8 : Rendu fidèle à Notion**
+En tant qu'utilisateur, je veux que le PDF ressemble à ma page Notion, afin de m'y retrouver immédiatement sur papier.
+_Critères d'acceptation :_ couverture, icône de la page et emojis sont imprimés. Les sélections et statuts sont des étiquettes colorées aux couleurs de Notion. Chaque base porte le nom et l'icône de sa base d'origine, et l'onglet de sa vue. Les colonnes reprennent les largeurs et la visibilité de la vue. Une vue groupée est imprimée par groupes, une vue calendrier comme une grille de la période affichée, une galerie comme des cartes. Les colonnes de la page sont respectées tant que leur contenu y tient. Une page contenant des bases en colonnes passe en paysage.
+
+**Hors périmètre V1 :** impression d'une base Notion seule (hors page), contenu des sous-pages, choix d'une autre vue que la première, ordre manuel des groupes, images dans le contenu, tableaux, callouts, logo ou charte Teconex. On les ajoutera ensuite, chacun sous forme de nouvelle user story.
 
 **Hypothèse à confirmer :** j'ai supposé qu'en V1 tu imprimes des pages isolées, à la demande.

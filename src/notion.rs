@@ -1,24 +1,38 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
+use chrono::{Datelike, NaiveDate};
 use serde_json::Value;
 
-use crate::model::{Block, Page, Span};
+use crate::model::{Block, Cell, Column, Database, Layout, Page, RowGroup, Span};
 use crate::properties;
 
 const API_BASE: &str = "https://api.notion.com/v1";
 const NOTION_VERSION: &str = "2026-03-11";
 const MAX_RETRIES: u32 = 3;
+/// En dessous de ce nombre de lignes, lire les pages une à une coûte moins qu'une requête groupée.
+const BULK_THRESHOLD: usize = 5;
+/// Requêtes simultanées maximum : assez pour masquer la latence, assez peu pour ménager
+/// la limite de débit de Notion (environ 3 requêtes par seconde en moyenne).
+const MAX_CONCURRENT_REQUESTS: usize = 4;
 
+/// Client de l'API Notion. Les blocs frères sont récupérés en parallèle : l'état partagé
+/// est donc protégé, et le nombre de requêtes en vol est plafonné.
 pub struct Client {
     agent: ureq::Agent,
     token: String,
     /// Avertissements collectés pendant la récupération (blocs non gérés…).
-    pub warnings: Vec<String>,
+    warnings: Mutex<Vec<String>>,
+    /// Nombre de bases ignorées faute d'accès (vues liées vers une base non partagée).
+    access_denied: AtomicUsize,
     /// Titres des pages liées par des relations, pour ne les demander qu'une fois.
-    relation_titles: HashMap<String, String>,
+    relation_titles: Mutex<HashMap<String, String>>,
+    /// Nombre de requêtes HTTP en cours, plafonné à `MAX_CONCURRENT_REQUESTS`.
+    in_flight: (Mutex<usize>, Condvar),
 }
 
 impl Client {
@@ -27,25 +41,58 @@ impl Client {
             .http_status_as_error(false)
             .build()
             .into();
-        Self { agent, token, warnings: Vec::new(), relation_titles: HashMap::new() }
+        Self {
+            agent,
+            token,
+            warnings: Mutex::new(Vec::new()),
+            access_denied: AtomicUsize::new(0),
+            relation_titles: Mutex::new(HashMap::new()),
+            in_flight: (Mutex::new(0), Condvar::new()),
+        }
+    }
+
+    pub fn warnings(&self) -> Vec<String> {
+        self.warnings.lock().unwrap().clone()
+    }
+
+    pub fn access_denied(&self) -> usize {
+        self.access_denied.load(Ordering::Relaxed)
     }
 
     /// Récupère le titre et le contenu (récursif) d'une page.
-    pub fn fetch_page(&mut self, page_id: &str) -> Result<Page> {
+    pub fn fetch_page(&self, page_id: &str) -> Result<Page> {
         let page = self.get(&format!("{API_BASE}/pages/{page_id}"))?;
         let title = page_title(&page);
-        let blocks = self.fetch_blocks(page_id)?;
-        Ok(Page { title, blocks })
+        let icon = page["icon"]["emoji"].as_str().map(str::to_owned);
+        let cover_url = page["cover"]["external"]["url"].as_str().or(page["cover"]["file"]["url"].as_str());
+        // Couverture et contenu se téléchargent en parallèle ; une couverture illisible est simplement omise.
+        let (cover, blocks) = thread::scope(|scope| {
+            let cover = scope.spawn(|| cover_url.and_then(|url| self.download(url).ok()));
+            let blocks = self.fetch_blocks(page_id);
+            (cover.join().ok().flatten(), blocks)
+        });
+        Ok(Page { title, icon, cover, blocks: blocks? })
     }
 
-    fn fetch_blocks(&mut self, block_id: &str) -> Result<Vec<Block>> {
-        let mut blocks = Vec::new();
-        for raw in self.fetch_children(block_id)? {
-            if let Some(block) = self.convert_block(&raw)? {
-                blocks.push(block);
-            }
+    /// Télécharge un fichier public (couverture…), sans les en-têtes de l'API Notion.
+    fn download(&self, url: &str) -> Result<Vec<u8>> {
+        // Les couvertures Unsplash de Notion sont en pleine résolution : 1600 px suffisent en A4.
+        let url = if url.starts_with("https://images.unsplash.com/") && !url.contains("&w=") {
+            format!("{url}&w=1600")
+        } else {
+            url.to_owned()
+        };
+        let mut response = self.agent.get(&url).call()?;
+        if !response.status().is_success() {
+            bail!("HTTP {}", response.status());
         }
-        Ok(blocks)
+        Ok(response.body_mut().with_config().limit(30 * 1024 * 1024).read_to_vec()?)
+    }
+
+    fn fetch_blocks(&self, block_id: &str) -> Result<Vec<Block>> {
+        let children = self.fetch_children(block_id)?;
+        let converted = parallel_map(&children, |raw| self.convert_block(raw));
+        converted.into_iter().filter_map(Result::transpose).collect()
     }
 
     fn fetch_children(&self, block_id: &str) -> Result<Vec<Value>> {
@@ -68,7 +115,7 @@ impl Client {
         Ok(results)
     }
 
-    fn convert_block(&mut self, raw: &Value) -> Result<Option<Block>> {
+    fn convert_block(&self, raw: &Value) -> Result<Option<Block>> {
         let kind = raw["type"].as_str().unwrap_or("inconnu");
         let data = &raw[kind];
         let text = rich_text(&data["rich_text"]);
@@ -86,19 +133,28 @@ impl Client {
                 match kind {
                     "bulleted_list_item" => Block::BulletedItem { text, children },
                     "numbered_list_item" => Block::NumberedItem { text, children },
+                    "toggle" => Block::Toggle { text, children },
                     _ => Block::Paragraph { text, children },
                 }
             }
             "column_list" => {
-                let mut columns = Vec::new();
-                for column in self.fetch_children(id)? {
-                    let column_id = column["id"].as_str().unwrap_or_default();
-                    columns.push(self.fetch_blocks(column_id)?);
+                let columns = self.fetch_children(id)?;
+                let columns = parallel_map(&columns, |column| {
+                    let blocks = self.fetch_blocks(column["id"].as_str().unwrap_or_default())?;
+                    Ok(Column { width: column["column"]["width_ratio"].as_f64().unwrap_or(0.0), blocks })
+                });
+                let mut columns = columns.into_iter().collect::<Result<Vec<_>>>()?;
+                // Sans ratio fourni par Notion, les colonnes se partagent la largeur à parts égales.
+                if columns.iter().any(|c| c.width <= 0.0) {
+                    let share = 1.0 / columns.len().max(1) as f64;
+                    columns.iter_mut().for_each(|c| c.width = share);
                 }
                 Block::Columns(columns)
             }
             "child_page" => Block::ChildPage {
                 title: data["title"].as_str().filter(|t| !t.trim().is_empty()).unwrap_or("Sans titre").to_owned(),
+                // L'icône n'est pas dans le bloc : il faut lire la page (sans gravité si ça échoue).
+                icon: self.get(&format!("{API_BASE}/pages/{id}")).ok().and_then(|p| p["icon"]["emoji"].as_str().map(str::to_owned)),
                 url: format!("https://www.notion.so/{}", id.replace('-', "")),
             },
             "child_database" => {
@@ -120,9 +176,9 @@ impl Client {
         Ok(Some(block))
     }
 
-    /// Lit une base intégrée telle que l'affiche sa première vue (filtres, tri et colonnes
-    /// visibles compris) et la convertit en tableau.
-    fn fetch_database(&mut self, database_id: &str, block_title: &str) -> Result<Block> {
+    /// Lit une base intégrée telle que l'affiche sa première vue : filtres, tri, colonnes visibles,
+    /// groupes, et disposition (tableau, calendrier ou galerie).
+    fn fetch_database(&self, database_id: &str, block_title: &str) -> Result<Block> {
         let display_name = |title: &str| if title.is_empty() { "sans titre".to_owned() } else { title.to_owned() };
         let views = self
             .get(&format!("{API_BASE}/views?database_id={database_id}"))
@@ -131,48 +187,132 @@ impl Client {
             bail!("base « {} » sans vue, ignorée", display_name(block_title));
         };
         let view = self.get(&format!("{API_BASE}/views/{view_id}"))?;
-
-        // Les vues liées s'appellent « Untitled » côté API : le nom de la vue est plus parlant.
-        let view_name = view["name"].as_str().unwrap_or_default().trim();
-        let title = match block_title.trim() {
-            "" | "Untitled" if !view_name.is_empty() => view_name.to_owned(),
-            t => t.to_owned(),
-        };
+        let view_name = view["name"].as_str().unwrap_or_default().trim().to_owned();
 
         let data_source_id = view["data_source_id"].as_str().unwrap_or_default();
-        let schema = self.get(&format!("{API_BASE}/data_sources/{data_source_id}")).map_err(|_| {
-            anyhow!(
-                "base « {} » ignorée : c'est une vue liée dont la base d'origine n'est pas partagée avec l'intégration \
-                 (dans Notion, ouvrez la base d'origine, « ••• » > « Connexions »)",
-                display_name(&title)
-            )
-        })?;
+        let schema = match self.get(&format!("{API_BASE}/data_sources/{data_source_id}")) {
+            Ok(schema) => schema,
+            Err(_) => {
+                self.access_denied.fetch_add(1, Ordering::Relaxed);
+                let name = if matches!(block_title.trim(), "" | "Untitled") { &view_name } else { block_title };
+                bail!(
+                    "base « {} » ignorée : c'est une vue liée dont la base d'origine n'est pas partagée avec l'intégration",
+                    display_name(name)
+                );
+            }
+        };
+        // Comme Notion, on titre la base par le nom et l'icône de sa base d'origine.
+        let title = Some(plain(&rich_text(&schema["title"])))
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| block_title.to_owned());
+        let icon = schema["icon"]["emoji"].as_str().map(str::to_owned);
+
+        let today = chrono::Local::now().date_naive();
+        // Un calendrier n'a souvent aucun filtre : c'est sa plage d'affichage (semaine ou mois)
+        // qui restreint les lignes. On la reproduit.
+        let calendar = calendar_range(&view, today);
         let columns = view_columns(&view, &schema);
 
-        let mut rows = Vec::new();
-        for page_id in self.query_view(view_id)? {
-            let page = self.get(&format!("{API_BASE}/pages/{page_id}"))?;
-            let props: Vec<&Value> = page["properties"].as_object().map(|p| p.values().collect()).unwrap_or_default();
-            let mut row = Vec::new();
-            for column in &columns {
-                let prop = props.iter().find(|p| p["id"].as_str().map(percent_decode).as_deref() == Some(&column.id));
-                row.push(prop.map(|p| self.property_cell(p)).unwrap_or_default());
+        // La vue donne l'ordre et le filtrage exacts, mais seulement des identifiants : on récupère
+        // les lignes par paquets de 100 via la source de données plutôt qu'une par une.
+        let ids = self.query_view(view_id)?;
+        let mut bulk = if ids.len() > BULK_THRESHOLD {
+            self.query_data_source(data_source_id, &view["filter"]).unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+        let mut pages = Vec::new();
+        for page_id in ids {
+            let page = match bulk.remove(&page_id.replace('-', "")) {
+                Some(page) => page,
+                None => self.get(&format!("{API_BASE}/pages/{page_id}"))?,
+            };
+            if let Some(cal) = &calendar {
+                if !page_date(&page, &cal.date_property_id).is_some_and(|(start, end)| start <= cal.end && end >= cal.start) {
+                    continue;
+                }
             }
-            rows.push(row);
+            pages.push(page);
         }
+        let row = |page: &Value| -> Vec<Cell> { columns.iter().map(|c| self.page_cell(page, &c.id)).collect() };
 
-        // Sans configuration de colonnes dans la vue, on retire celles qui sont vides partout.
-        let keep: Vec<bool> = columns
-            .iter()
-            .enumerate()
-            .map(|(i, c)| c.from_view || i == 0 || rows.iter().any(|row: &Vec<Vec<Span>>| !row[i].is_empty()))
-            .collect();
-        let headers = columns.into_iter().zip(&keep).filter(|(_, k)| **k).map(|(c, _)| c.name).collect();
-        let rows = rows
-            .into_iter()
-            .map(|row| row.into_iter().zip(&keep).filter(|(_, k)| **k).map(|(c, _)| c).collect())
-            .collect();
-        Ok(Block::Table { title, headers, rows })
+        let layout = match (&calendar, view["configuration"]["type"].as_str()) {
+            (Some(cal), _) => {
+                let entries = pages
+                    .iter()
+                    .filter_map(|page| {
+                        let (start, _) = page_date(page, &cal.date_property_id)?;
+                        Some((start.max(cal.start), self.page_cell(page, "title")))
+                    })
+                    .collect();
+                let first_day = monday_of(cal.start);
+                let weeks = ((cal.end - first_day).num_days() as usize) / 7 + 1;
+                let month = (cal.end - cal.start).num_days().gt(&7).then(|| cal.start.month());
+                Layout::Calendar { first_day, weeks, month, today, label: cal.label.clone(), entries }
+            }
+            (None, Some("gallery")) => Layout::Gallery {
+                cards: pages.iter().map(|page| row(page).into_iter().filter(|cell| !cell.is_empty()).collect()).collect(),
+            },
+            _ => {
+                let rows: Vec<Vec<Cell>> = pages.iter().map(row).collect();
+                // Les colonnes que la vue ne nomme pas et qui sont vides partout volent de la place.
+                let keep: Vec<bool> = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| c.from_view || c.id == "title" || rows.iter().any(|row| !is_blank(&row[i])))
+                    .collect();
+                let strip = |row: Vec<Cell>| -> Vec<Cell> {
+                    row.into_iter().zip(&keep).filter(|(_, k)| **k).map(|(c, _)| c).collect()
+                };
+                let kept: Vec<&ViewColumn> = columns.iter().zip(&keep).filter(|(_, k)| **k).map(|(c, _)| c).collect();
+                let headers = kept.iter().map(|c| c.name.clone()).collect();
+                let widths = kept.iter().map(|c| c.width).collect();
+                let groups = group_rows(&view, &schema, &pages, rows)
+                    .into_iter()
+                    .map(|g| RowGroup { label: g.label, rows: g.rows.into_iter().map(strip).collect() })
+                    .collect();
+                Layout::Table { headers, widths, groups }
+            }
+        };
+        Ok(Block::Database(Database { title, icon, view_name, layout }))
+    }
+
+    /// Cellule d'une propriété de page ; la cellule titre reprend l'icône de la page, comme dans Notion.
+    fn page_cell(&self, page: &Value, property_id: &str) -> Cell {
+        let mut cell = page_property(page, property_id).map(|p| self.property_cell(p)).unwrap_or_default();
+        if property_id == "title" {
+            if let Some(emoji) = page["icon"]["emoji"].as_str() {
+                cell.insert(0, Span { text: format!("{emoji} "), ..Default::default() });
+            }
+        }
+        cell
+    }
+
+    /// Toutes les lignes d'une source de données répondant au filtre de la vue, indexées par ID sans tirets.
+    /// Les filtres rapides n'y sont pas appliqués : le résultat peut contenir plus de lignes que la vue.
+    fn query_data_source(&self, data_source_id: &str, filter: &Value) -> Result<HashMap<String, Value>> {
+        let mut pages = HashMap::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut query = serde_json::json!({ "page_size": 100 });
+            if !filter.is_null() {
+                query["filter"] = filter.clone();
+            }
+            if let Some(c) = &cursor {
+                query["start_cursor"] = c.clone().into();
+            }
+            let body = self.post(&format!("{API_BASE}/data_sources/{data_source_id}/query"), &query)?;
+            for page in body["results"].as_array().into_iter().flatten() {
+                if let Some(id) = page["id"].as_str() {
+                    pages.insert(id.replace('-', ""), page.clone());
+                }
+            }
+            match body["next_cursor"].as_str() {
+                Some(next) if body["has_more"].as_bool() == Some(true) => cursor = Some(next.to_owned()),
+                _ => break,
+            }
+        }
+        Ok(pages)
     }
 
     /// IDs des lignes d'une vue, filtrées et triées comme dans Notion.
@@ -194,7 +334,7 @@ impl Client {
         Ok(ids)
     }
 
-    fn property_cell(&mut self, prop: &Value) -> Vec<Span> {
+    fn property_cell(&self, prop: &Value) -> Vec<Span> {
         if prop["type"] != "relation" {
             return properties::cell(prop);
         }
@@ -208,19 +348,21 @@ impl Client {
         properties::join(Some(titles))
     }
 
-    fn relation_title(&mut self, page_id: &str) -> Vec<Span> {
-        if !self.relation_titles.contains_key(page_id) {
+    fn relation_title(&self, page_id: &str) -> Vec<Span> {
+        let cached = self.relation_titles.lock().unwrap().get(page_id).cloned();
+        let title = cached.unwrap_or_else(|| {
             let title = match self.get(&format!("{API_BASE}/pages/{page_id}")) {
                 Ok(page) => page_title(&page),
                 Err(_) => "(page non partagée)".to_owned(),
             };
-            self.relation_titles.insert(page_id.to_owned(), title);
-        }
-        vec![Span { text: self.relation_titles[page_id].clone(), ..Default::default() }]
+            self.relation_titles.lock().unwrap().insert(page_id.to_owned(), title.clone());
+            title
+        });
+        vec![Span { text: title, ..Default::default() }]
     }
 
-    fn warn(&mut self, message: String) {
-        self.warnings.push(message);
+    fn warn(&self, message: String) {
+        self.warnings.lock().unwrap().push(message);
     }
 
     fn get(&self, url: &str) -> Result<Value> {
@@ -245,6 +387,7 @@ impl Client {
 
     /// Exécute une requête, en réessayant si l'API demande de ralentir (HTTP 429).
     fn send(&self, call: impl Fn() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<Value> {
+        let _permit = self.acquire_request_slot();
         let mut attempt = 0;
         loop {
             let mut response = call().map_err(|e| anyhow!("Impossible de joindre l'API Notion : {e}"))?;
@@ -274,6 +417,38 @@ impl Client {
     }
 }
 
+/// Libère une place de requête à la fin de sa portée.
+struct RequestSlot<'a>(&'a (Mutex<usize>, Condvar));
+
+impl Drop for RequestSlot<'_> {
+    fn drop(&mut self) {
+        let (count, freed) = self.0;
+        *count.lock().unwrap() -= 1;
+        freed.notify_one();
+    }
+}
+
+impl Client {
+    fn acquire_request_slot(&self) -> RequestSlot<'_> {
+        let (count, freed) = &self.in_flight;
+        let mut count = freed.wait_while(count.lock().unwrap(), |n| *n >= MAX_CONCURRENT_REQUESTS).unwrap();
+        *count += 1;
+        RequestSlot(&self.in_flight)
+    }
+}
+
+/// Applique `f` à chaque élément dans un thread distinct, en conservant l'ordre des résultats.
+fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    if items.len() <= 1 {
+        return items.iter().map(f).collect();
+    }
+    thread::scope(|scope| {
+        let f = &f;
+        let handles: Vec<_> = items.iter().map(|item| scope.spawn(move || f(item))).collect();
+        handles.into_iter().map(|h| h.join().expect("thread de récupération Notion interrompu")).collect()
+    })
+}
+
 fn api_error(status: u16, body: &Value) -> anyhow::Error {
     let code = body["code"].as_str().unwrap_or_default();
     let message = body["message"].as_str().unwrap_or_default();
@@ -290,17 +465,125 @@ fn api_error(status: u16, body: &Value) -> anyhow::Error {
     }
 }
 
-struct Column {
+/// Propriété d'une page par identifiant (décodé).
+fn page_property<'a>(page: &'a Value, id: &str) -> Option<&'a Value> {
+    page["properties"]
+        .as_object()?
+        .values()
+        .find(|p| p["id"].as_str().map(percent_decode).as_deref() == Some(id))
+}
+
+/// Début et fin (inclus) de la date d'une page ; une date simple a la même fin que son début.
+fn page_date(page: &Value, property_id: &str) -> Option<(NaiveDate, NaiveDate)> {
+    let date = &page_property(page, property_id)?["date"];
+    let parse = |v: &Value| v.as_str()?.get(..10).and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
+    let start = parse(&date["start"])?;
+    Some((start, parse(&date["end"]).unwrap_or(start)))
+}
+
+/// Plage affichée par une vue calendrier : la semaine (lundi → dimanche) ou le mois en cours.
+struct CalendarRange {
+    date_property_id: String,
+    start: NaiveDate,
+    end: NaiveDate,
+    label: String,
+}
+
+fn calendar_range(view: &Value, today: NaiveDate) -> Option<CalendarRange> {
+    let config = &view["configuration"];
+    if config["type"] != "calendar" {
+        return None;
+    }
+    let date_property_id = percent_decode(config["date_property_id"].as_str()?);
+    let (start, end, label) = if config["view_range"] == "week" {
+        let start = today - chrono::Duration::days(i64::from(today.weekday().num_days_from_monday()));
+        let end = start + chrono::Duration::days(6);
+        let label = format!("semaine du {} au {}", start.format("%d/%m"), end.format("%d/%m/%Y"));
+        (start, end, label)
+    } else {
+        let start = today.with_day(1)?;
+        let next_month = if start.month() == 12 {
+            NaiveDate::from_ymd_opt(start.year() + 1, 1, 1)?
+        } else {
+            NaiveDate::from_ymd_opt(start.year(), start.month() + 1, 1)?
+        };
+        let label = format!("{} {}", MONTHS[start.month0() as usize], start.year());
+        (start, next_month.pred_opt()?, label)
+    };
+    Some(CalendarRange { date_property_id, start, end, label })
+}
+
+const MONTHS: [&str; 12] = [
+    "janvier", "février", "mars", "avril", "mai", "juin",
+    "juillet", "août", "septembre", "octobre", "novembre", "décembre",
+];
+
+/// Cellule sans rien d'imprimable (Notion renvoie parfois des morceaux de texte vides).
+fn is_blank(cell: &Cell) -> bool {
+    cell.iter().all(|span| span.text.trim().is_empty())
+}
+
+fn monday_of(day: NaiveDate) -> NaiveDate {
+    day - chrono::Duration::days(i64::from(day.weekday().num_days_from_monday()))
+}
+
+/// Répartit les lignes selon la propriété de regroupement de la vue (sélection, multi-sélection
+/// ou statut), dans l'ordre des options de la base. Une ligne multi-sélection apparaît dans chacun
+/// de ses groupes, comme dans Notion. Les groupes vides ne sont pas imprimés.
+fn group_rows(view: &Value, schema: &Value, pages: &[Value], rows: Vec<Vec<Cell>>) -> Vec<RowGroup> {
+    let group_by = &view["configuration"]["group_by"];
+    let kind = group_by["type"].as_str().unwrap_or_default();
+    let property_id = group_by["property_id"].as_str().map(percent_decode);
+    let options = property_id.as_deref().and_then(|id| {
+        let prop = schema["properties"].as_object()?.values().find(|p| p["id"].as_str().map(percent_decode).as_deref() == Some(id))?;
+        prop[kind]["options"].as_array().cloned()
+    });
+    let (Some(property_id), Some(options), "select" | "multi_select" | "status") = (property_id, options, kind) else {
+        return vec![RowGroup { label: None, rows }];
+    };
+
+    let values = |page: &Value| -> Vec<String> {
+        let value = page_property(page, &property_id).map(|p| &p[kind]);
+        match value {
+            Some(Value::Array(items)) => items.iter().filter_map(|i| i["name"].as_str().map(str::to_owned)).collect(),
+            Some(v) => v["name"].as_str().map(|n| vec![n.to_owned()]).unwrap_or_default(),
+            None => Vec::new(),
+        }
+    };
+    let page_values: Vec<Vec<String>> = pages.iter().map(values).collect();
+
+    let mut groups: Vec<RowGroup> = options
+        .iter()
+        .map(|option| {
+            let name = option["name"].as_str().unwrap_or_default();
+            let rows = rows.iter().zip(&page_values).filter(|(_, v)| v.iter().any(|n| n == name)).map(|(r, _)| r.clone()).collect();
+            RowGroup { label: Some(properties::tag(name, option["color"].as_str().unwrap_or("default"))), rows }
+        })
+        .collect();
+    let property_name = group_by["property_name"].as_str().unwrap_or("cette propriété");
+    let without: Vec<Vec<Cell>> = rows.iter().zip(&page_values).filter(|(_, v)| v.is_empty()).map(|(r, _)| r.clone()).collect();
+    groups.push(RowGroup {
+        label: Some(vec![Span { text: format!("Sans « {property_name} »"), ..Default::default() }]),
+        rows: without,
+    });
+    groups.retain(|g| !g.rows.is_empty());
+    groups
+}
+
+struct ViewColumn {
     /// Identifiant de propriété, décodé (l'API le renvoie parfois encodé façon URL).
     id: String,
     name: String,
+    /// Largeur de la colonne dans Notion, en pixels.
+    width: u32,
     /// Colonne choisie explicitement dans la configuration de la vue.
     from_view: bool,
 }
 
 /// Colonnes à imprimer : celles visibles dans la vue, dans son ordre ; à défaut, toutes
 /// les propriétés de la base, titre en premier. Les boutons n'ont rien à imprimer.
-fn view_columns(view: &Value, schema: &Value) -> Vec<Column> {
+fn view_columns(view: &Value, schema: &Value) -> Vec<ViewColumn> {
+    let is_table = matches!(view["configuration"]["type"].as_str(), None | Some("table"));
     let schema_props: Vec<(String, String, &str)> = schema["properties"]
         .as_object()
         .into_iter()
@@ -309,7 +592,7 @@ fn view_columns(view: &Value, schema: &Value) -> Vec<Column> {
         .map(|(name, p)| (percent_decode(p["id"].as_str().unwrap_or_default()), name.clone(), p["type"].as_str().unwrap_or_default()))
         .collect();
 
-    let configured: Vec<Column> = view["configuration"]["properties"]
+    let configured: Vec<ViewColumn> = view["configuration"]["properties"]
         .as_array()
         .into_iter()
         .flatten()
@@ -318,20 +601,54 @@ fn view_columns(view: &Value, schema: &Value) -> Vec<Column> {
             let id = percent_decode(p["property_id"].as_str()?);
             // Une propriété absente du schéma (relation vers une base non partagée…) est ignorée.
             let (_, name, _) = schema_props.iter().find(|(sid, _, _)| *sid == id)?;
-            Some(Column { id, name: name.clone(), from_view: true })
+            let width = p["width"].as_u64().map_or(DEFAULT_COLUMN_WIDTH, |w| w as u32);
+            Some(ViewColumn { id, name: name.clone(), width, from_view: true })
         })
         .collect();
     if !configured.is_empty() {
-        return configured;
+        let mut columns = configured;
+        // Dans un tableau qui ne masque rien explicitement, les propriétés que la vue ne mentionne
+        // pas restent visibles, à la suite. Si la vue masque des colonnes, Notion masque aussi celles
+        // ajoutées depuis. Dans une galerie ou un calendrier, seules les propriétés cochées s'affichent.
+        let hides_some = view["configuration"]["properties"]
+            .as_array()
+            .is_some_and(|props| props.iter().any(|p| p["visible"].as_bool() == Some(false)));
+        if is_table && !hides_some {
+            let listed: Vec<String> = view["configuration"]["properties"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|p| p["property_id"].as_str().map(percent_decode))
+                .collect();
+            columns.extend(
+                schema_props
+                    .iter()
+                    .filter(|(id, _, _)| !listed.contains(id))
+                    .map(|(id, name, _)| ViewColumn { id: id.clone(), name: name.clone(), width: DEFAULT_COLUMN_WIDTH, from_view: false }),
+            );
+        }
+        if !columns.iter().any(|c| c.id == "title") {
+            columns.insert(0, ViewColumn { id: "title".into(), name: String::new(), width: TITLE_COLUMN_WIDTH, from_view: true });
+        }
+        return columns;
     }
 
     let mut columns: Vec<&(String, String, &str)> = schema_props.iter().filter(|(_, _, t)| *t == "title").collect();
     columns.extend(schema_props.iter().filter(|(_, _, t)| *t != "title"));
     columns
         .into_iter()
-        .map(|(id, name, _)| Column { id: id.clone(), name: name.clone(), from_view: false })
+        .map(|(id, name, t)| ViewColumn {
+            id: id.clone(),
+            name: name.clone(),
+            width: if *t == "title" { TITLE_COLUMN_WIDTH } else { DEFAULT_COLUMN_WIDTH },
+            from_view: false,
+        })
         .collect()
 }
+
+/// Largeurs par défaut des colonnes dans Notion, en pixels.
+const DEFAULT_COLUMN_WIDTH: u32 = 200;
+const TITLE_COLUMN_WIDTH: u32 = 280;
 
 /// Décode les séquences « %XX » (ex. « %7DhRT » → « }hRT »).
 fn percent_decode(s: &str) -> String {
@@ -376,6 +693,7 @@ pub fn rich_text(value: &Value) -> Vec<Span> {
                 strikethrough: flag("strikethrough"),
                 code: flag("code"),
                 link: item["href"].as_str().map(absolute_link),
+                tag: None,
             }
         })
         .collect()
@@ -446,6 +764,31 @@ mod tests {
     }
 
     #[test]
+    fn computes_calendar_ranges() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 31).unwrap(); // un samedi
+        let week = serde_json::json!({"configuration": {"type": "calendar", "date_property_id": "CDqJ", "view_range": "week"}});
+        let range = calendar_range(&week, today).unwrap();
+        assert_eq!((range.start.to_string(), range.end.to_string()), ("2026-10-26".into(), "2026-11-01".into()));
+        assert_eq!(range.label, "semaine du 26/10 au 01/11/2026");
+
+        let month = serde_json::json!({"configuration": {"type": "calendar", "date_property_id": "%7DhRT"}});
+        let range = calendar_range(&month, NaiveDate::from_ymd_opt(2026, 12, 15).unwrap()).unwrap();
+        assert_eq!((range.start.to_string(), range.end.to_string()), ("2026-12-01".into(), "2026-12-31".into()));
+        assert_eq!((range.date_property_id.as_str(), range.label.as_str()), ("}hRT", "décembre 2026"));
+
+        assert!(calendar_range(&serde_json::json!({"configuration": {"type": "table"}}), today).is_none());
+    }
+
+    #[test]
+    fn reads_page_dates() {
+        let page = serde_json::json!({"properties": {"Date": {"id": "CDqJ", "type": "date",
+            "date": {"start": "2026-10-28T19:00:00.000+01:00", "end": null}}}});
+        let day = NaiveDate::from_ymd_opt(2026, 10, 28).unwrap();
+        assert_eq!(page_date(&page, "CDqJ"), Some((day, day)));
+        assert_eq!(page_date(&page, "autre"), None);
+    }
+
+    #[test]
     fn decodes_property_ids() {
         assert_eq!(percent_decode("%7DhRT"), "}hRT");
         assert_eq!(percent_decode("%60%60Xa"), "``Xa");
@@ -469,6 +812,15 @@ mod tests {
         ]}});
         let names: Vec<String> = view_columns(&view, &schema).into_iter().map(|c| c.name).collect();
         assert_eq!(names, ["Jour", "Date"]);
+
+        // Une vue qui ne masque rien laisse voir les propriétés qu'elle ne mentionne pas.
+        let partial = serde_json::json!({"configuration": {"type": "table", "properties": [
+            {"property_id": "title", "visible": true, "width": 120}
+        ]}});
+        let columns = view_columns(&partial, &schema);
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["Jour", "Date", "Note"]);
+        assert_eq!(columns[0].width, 120);
 
         let names: Vec<String> = view_columns(&serde_json::json!({}), &schema).into_iter().map(|c| c.name).collect();
         assert_eq!(names, ["Jour", "Date", "Note"]);
