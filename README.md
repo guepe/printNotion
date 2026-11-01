@@ -100,3 +100,7 @@ cargo test
 Built with [Typst](https://typst.app) for PDF layout, [egui](https://github.com/emilk/egui) for the
 window, and the [Notion API](https://developers.notion.com) (version `2026-03-11`, Views API).
 User stories, in French, are in [`doc/user-stories.md`](doc/user-stories.md).
+
+## License
+
+[MIT](LICENSE) © 2026 Pierre-Henri Delaval
